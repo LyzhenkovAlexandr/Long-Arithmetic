@@ -1,0 +1,264 @@
+name: BuildTest
+
+on:
+  workflow_dispatch:
+    inputs:
+      example:
+        description: "Run example from the task (short numbers)"
+        default: true
+        type: boolean
+      plus_op:
+        description: "Run test with operator+ (long numbers)"
+        default: true
+        type: boolean
+      compare_op:
+        description: "Run test with operator> (long numbers)"
+        default: true
+        type: boolean
+
+env:
+  COMPILER: "clang++"
+  C_ARGS: "-std=c++20 -D _CRT_SECURE_NO_WARNINGS -D _USE_MATH_DEFINES -O2  -Werror=return-type -Werror=strict-prototypes -Wvla -Wunused-variable"
+  C_FILES: "-I../include $((Get-ChildItem -Path .. -Include @('*.cpp') -Recurse -ErrorAction SilentlyContinue -Force).FullName)"
+  INPUT: "test_data/in_"
+  OUTPUT: "test_data/out_"
+  REF: "test_data/ref_"
+  BUILDLOG: "build.log"
+  OUTLOG: "result.log"
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  buildtest:
+    if: ((github.actor == 'RonoveRaum') || (github.run_number < 20))
+    strategy:
+      max-parallel: 1
+      fail-fast: true
+      matrix:
+        os: [ubuntu-22.04, windows-latest] #
+
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
+
+    env:
+      EXE: __test.exe
+      STUPID_CLANG15_FLAG: $(If ('${{ matrix.os }}' -eq 'windows-latest') {'-Wno-deprecated-non-prototype'} Else {''})
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: params
+        id: params
+        if: matrix.os != 'windows-latest'
+        run: |
+          echo "Parameters:" >> $env:GITHUB_STEP_SUMMARY
+          echo "  run example: $${{ inputs.example }}" >> $env:GITHUB_STEP_SUMMARY
+          echo "  run plus_op: $${{ inputs.plus_op }}" >> $env:GITHUB_STEP_SUMMARY
+          echo "  run compare_op: $${{ inputs.compare_op }}" >> $env:GITHUB_STEP_SUMMARY
+
+
+      - name: clang_format
+        id: clang_format
+        if: matrix.os != 'windows-latest'
+        run: |
+          echo "# clang-format" >> $env:GITHUB_STEP_SUMMARY
+
+          clang-format-12 --version            
+          $a = Get-ChildItem -Recurse -Force -File -Name -LiteralPath '.' -Include @('*.cpp', '*.h', '*.hpp') | Where-Object { $_ -notlike 'return_codes.h' }
+
+          echo "    Checking formating files: $a
+                    ">> $env:GITHUB_STEP_SUMMARY
+
+          clang-format-12 --dry-run --style=file $a 2>&1 | tee log.txt
+
+          if ((Get-ChildItem -Path log.txt).Length -eq 0) 
+          {
+            echo "    clang-format OK ✅
+                     ">> $env:GITHUB_STEP_SUMMARY
+          }
+          else
+          {
+            echo "    clang-format !OK ❌
+                      ">> $env:GITHUB_STEP_SUMMARY                                      
+            echo "
+            $(Get-Content log.txt -Raw)
+            " >> $env:GITHUB_STEP_SUMMARY
+          }
+
+      - name: build
+        id: build
+        run: |
+          git config user.name github-actions
+          git config user.email github-actions@github.com 
+            
+          [void](mkdir __build)
+          cd __build 
+
+          try 
+          {
+            pwsh -Command { ${{env.COMPILER}} --version }
+            $ErrorActionPreference = 'SilentlyContinue'
+            
+            & ${{env.COMPILER}} ${{env.C_ARGS}} ${{env.STUPID_CLANG15_FLAG}} ${{env.C_FILES}} -o ${{env.EXE}} *>&1 > ${{env.BUILDLOG}}
+
+          } 
+          catch 
+          {
+            Write-Output "❌ build failed!"
+            echo "# Build: 
+               failed" >> $env:GITHUB_STEP_SUMMARY
+            echo "Build exit code: $LastExitCode" >> $env:GITHUB_STEP_SUMMARY
+            $blog="$(Get-Content ${{env.BUILDLOG}} -Raw)"
+            echo "Build log: $blog" >> $env:GITHUB_STEP_SUMMARY 
+          } 
+          finally 
+          {
+            $blog=$(Get-Content ${{env.BUILDLOG}} -Raw)
+            echo "# Build log (can be empty):" >> $env:GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo $blog >> $env:GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+
+            "::group::Build log"
+            echo $blog
+            echo "::endgroup::"  
+          }
+
+      - name: tests
+        id: tests
+        run: |
+          if ('${{ matrix.os }}' -eq 'windows-latest') 
+          { 
+            echo "# Fetch all"
+            git fetch --all
+            git checkout main
+            git pull
+          }
+
+          cd __build
+
+          $tests = @()
+          $tests += New-Object PSObject -Property @{ active=$${{ inputs.plus_op }}; name="operator+"; id=1 }
+          $tests += New-Object PSObject -Property @{ active=$${{ inputs.compare_op }}; name="operator>"; id=2 }
+          $tests += New-Object PSObject -Property @{ active=$${{ inputs.example }}; name="example"; id=0 }
+
+          $test_exit_code = 0
+          foreach ($i in 2..0)
+          {
+            if (-not $tests[$i].active) { continue }
+
+            echo "# Test $($tests[$i].name)" >> $env:GITHUB_STEP_SUMMARY  
+            "::group::Output log test_$($tests[$i].name)"
+
+            $test_input = "../${{env.INPUT}}$i"
+            $test_ref = "../${{env.REF}}$i"
+            $test_output = "../${{env.OUTPUT}}${{matrix.os}}_$i"
+            
+            if (Test-Path $test_output) { Remove-Item $test_output }
+
+            & ./${{env.EXE}} $test_input $test_output 2>stderr.log 1>stdout.log
+            $exit_code_p = $LastExitCode           
+            
+            $stderr = if ((& Test-Path -Path stderr.log -PathType Leaf)) { $(Get-Content stderr.log -Raw) } else {'<empty>'}
+            $stdout = if ((& Test-Path -Path stdout.log -PathType Leaf)) { $(Get-Content stdout.log -Raw) } else {'<empty>'}
+                        
+            $ti = "https://github.com/"+"${{github.repository}}"+"/tree/main/${{env.INPUT}}$i"
+            $tr = "https://github.com/"+"${{github.repository}}"+"/tree/main/${{env.REF}}$i"
+            $to = "https://github.com/"+"${{github.repository}}"+"/tree/main/${{env.OUTPUT}}${{matrix.os}}_$i"
+            
+            echo "input: [${{env.INPUT}}$i]($ti)" >> $env:GITHUB_STEP_SUMMARY
+            echo "ref: [${{env.REF}}$i]($tr)" >> $env:GITHUB_STEP_SUMMARY  
+            echo "exit code: $exit_code_p
+            " >> $env:GITHUB_STEP_SUMMARY           
+                       
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "[stderr]: $stderr
+            " >> $env:GITHUB_STEP_SUMMARY           
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "[stdout]: $stdout
+            " >> $env:GITHUB_STEP_SUMMARY            
+            echo "" >> $GITHUB_STEP_SUMMARY
+
+            if ($exit_code_p -ne 0)
+            {               
+              echo "        ❌ [ERROR] Program completed with code $exit_code_p (!= SUCCESS)" >> $env:GITHUB_STEP_SUMMARY                
+              $test_exit_code += 10
+            }          
+            elseif ((& Test-Path -Path stderr.log -PathType Leaf) -and ((Get-ChildItem -Path stderr.log).Length -ne 0))
+            {
+              echo "        ❌ [ERROR] Stderr is not empty [program completed with code $exit_code_p]" >> $env:GITHUB_STEP_SUMMARY               
+              $test_exit_code += 100000
+            } 
+            elseif (-not (& Test-Path -Path $test_output -PathType Leaf))
+            {
+              echo "        ❌ [ERROR] Output file does not exist [program completed with code $exit_code_p]" >> $env:GITHUB_STEP_SUMMARY               
+              $test_exit_code += 100
+            }
+            elseif ((Get-ChildItem -Path $test_output).Length -eq 0) 
+            {
+              echo "        ❌ [ERROR] Output file is empty [program completed with code $exit_code_p]" >> $env:GITHUB_STEP_SUMMARY               
+              $test_exit_code += 1000
+            }
+            elseif ((& Test-Path -Path stdout.log -PathType Leaf) -and ((Get-ChildItem -Path stdout.log).Length -ne 0))
+            {
+              echo "        ❌ [ERROR] Stdout is not empty [program completed with code $exit_code_p]" >> $env:GITHUB_STEP_SUMMARY                
+              $test_exit_code += 10000
+            }
+            else
+            {
+              $ref_split = $(Get-Content $test_ref).split([System.Environment]::NewLine, [System.StringSplitOptions]::RemoveEmptyEntries)
+              $out_split = $(Get-Content $test_output).split([System.Environment]::NewLine, [System.StringSplitOptions]::RemoveEmptyEntries)
+
+              $res_test = $true
+              try
+              {
+                for($k=0; $k -lt $ref_split.count; $k++)
+                {
+                    $ref_num = $ref_split[$k] -split ' '
+                    $out_num = $out_split[$k] -split ' '
+
+                    if ($ref_num.Length -ne $out_num.Length)
+                    {
+                        $res_test = $false
+                        break
+                    }
+                    else 
+                    {                    
+                        $res_test = $res_test -and ($ref_num[0] -ceq $out_num[0])
+                    }
+                }
+              }
+              catch
+              {                  
+                $res_test = $false
+              }
+
+
+              if ($res_test)
+              { 
+                echo "        ✅ PASSED" >> $env:GITHUB_STEP_SUMMARY 
+              }
+              else
+              {
+                echo "        ❌ FAILED [output != expected]" >> $env:GITHUB_STEP_SUMMARY                
+                $test_exit_code += 1
+              } 
+
+              echo "output: [${{env.OUTPUT}}${{matrix.os}}_$i]($to)
+              " >> $env:GITHUB_STEP_SUMMARY 
+              if (Test-Path $test_output) { git add $test_output }
+            }
+            echo "[debug] error codes: $test_exit_code" >> $env:GITHUB_STEP_SUMMARY   
+          }
+          "::endgroup::"
+                            
+          "::group::[debug]"          
+          git commit -m "Automatically upload workflow results"
+          git push --force origin HEAD:main    
+
+          if ('${{ matrix.os }}' -eq 'windows-latest') { dir -Recurse -Path .. } else { ls -la -R .. }
+          "::endgroup::"
+             
+          exit($test_exit_code)
